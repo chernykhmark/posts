@@ -8,8 +8,8 @@
 Инвариант: write_post != edit_post. write_post пишет с нуля,
 edit_post вносит ТОЛЬКО запрошенное изменение (D-2, раздел 18).
 """
-
-from typing import Annotated, Optional
+import logging
+from typing import Annotated
 
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import InjectedToolArg, tool
@@ -20,6 +20,8 @@ from agent.prompts import render_prompt
 from db import get_db
 from db.repositories import PostsRepo
 
+logger = logging.getLogger(__name__)
+
 
 def _format_rules_for(platform: str) -> str:
     """Правила форматирования платформы из config (D-15). Дефолт — Telegram."""
@@ -29,25 +31,16 @@ def _format_rules_for(platform: str) -> str:
     return rules
 
 
-async def _recent_posts_block(user_id: int, platform: str) -> str:
-    """Последние N постов автора для защиты от дублей (раздел 10)."""
+async def _recent_posts_list(user_id: int) -> list[str]:
+    """Последние N постов автора (тексты) для защиты от дублей (раздел 10)."""
     try:
-        posts = await PostsRepo(get_db().pool).get_last_n(
+        rows = await PostsRepo(get_db().pool).get_last_n(
             user_id, settings.recent_posts_limit
         )
-    except Exception as e:
-        print(f"[generation.py] get_last_n failed: {e}")
-        return "(нет прошлых постов)"
-
-    if not posts:
-        return "(нет прошлых постов)"
-
-    lines = []
-    for p in posts:
-        text = (p.get("text") or "").strip().replace("\n", " ")
-        snippet = text[:150]
-        lines.append(f"- {snippet}")
-    return "\n".join(lines)
+    except Exception:
+        logger.exception("[generation.py] get_last_n недоступен")
+        return []
+    return [(r.get("text") or "").strip() for r in rows if r.get("text")]
 
 
 @tool
@@ -58,7 +51,7 @@ async def make_angle(
     """Придумать угол/ракурс подачи поста по теме. Вызывать, когда пользователь дал новую тему для поста, но угол ещё не выбран."""
     topic = (topic or "").strip()
     if not topic:
-        print("[generation.py] make_angle: empty topic -> error")
+        logger.info("[generation.py] make_angle: пустая тема → error")
         return {"error": "Не указана тема для угла."}
 
     try:
@@ -71,44 +64,54 @@ async def make_angle(
         )
         angle = (result or "").strip()
         if not angle:
-            print("[generation.py] make_angle: empty LLM output -> error")
+            logger.info("[generation.py] make_angle: пустой вывод LLM → error")
             return {"error": "Не удалось придумать угол, попробуй переформулировать тему."}
 
-        print(f"[generation.py] make_angle OK: {angle[:80]!r}")
+        logger.info("[generation.py] make_angle OK: %r", angle[:80])
         return {
             "result": angle,
             "updates_to_state": {"topic": topic, "angle": angle},
         }
-    except Exception as e:
-        print(f"[generation.py] make_angle failed: {e}")
+    except Exception:
+        logger.exception("[generation.py] make_angle failed")
         return {"error": "Техническая ошибка при генерации угла."}
 
 
 @tool
 async def write_post(
-    user_id: Annotated[int, InjectedToolArg] = 0,
     angle: Annotated[str, InjectedToolArg] = "",
     platform: Annotated[str, InjectedToolArg] = "",
     style_description: Annotated[str, InjectedToolArg] = "",
+    user_id: Annotated[int, InjectedToolArg] = 0,
+    critique_issues: Annotated[list, InjectedToolArg] = None,
 ) -> dict:
     """Написать пост С НУЛЯ по выбранному углу, стилю автора и платформе. Вызывать для генерации нового текста поста (не для правки существующего)."""
     angle = (angle or "").strip()
     if not angle:
-        print("[generation.py] write_post: no angle in state -> error")
+        logger.info("[generation.py] write_post: пустой angle → error")
         return {"error": "Сначала нужен угол поста — предложи или уточни угол."}
 
     platform = (platform or "").strip() or "Telegram"
     style_description = (style_description or "").strip() or "(стиль не задан)"
 
     try:
-        recent = await _recent_posts_block(user_id, platform)
+        recent_posts = await _recent_posts_list(user_id)
+
+        issues_block = ""
+        if critique_issues:
+            issues_block = (
+                "Обязательно исправь проблемы предыдущей версии:\n- "
+                + "\n- ".join(critique_issues)
+            )
+
         prompt = render_prompt(
             "write_post",
             angle=angle,
-            style_description=style_description,
             platform=platform,
             format_rules=_format_rules_for(platform),
-            recent_posts=recent,
+            style_description=style_description,
+            recent_posts="\n---\n".join(recent_posts) if recent_posts else "нет",
+            critique_issues=issues_block,
         )
         result = await call_llm(
             messages=[HumanMessage(content=prompt)],
@@ -118,50 +121,54 @@ async def write_post(
         )
         text = (result or "").strip()
         if not text:
-            print("[generation.py] write_post: empty LLM output -> error")
+            logger.info("[generation.py] write_post: пустой вывод LLM → error")
             return {"error": "Не удалось сгенерировать текст, попробуй ещё раз."}
 
-        print(f"[generation.py] write_post OK (platform={platform}, len={len(text)})")
+        logger.info("[generation.py] write_post OK (platform=%s, len=%d)", platform, len(text))
         return {
             "result": text,
             "updates_to_state": {"draft_text": text, "platform": platform},
         }
-    except Exception as e:
-        print(f"[generation.py] write_post failed: {e}")
+    except Exception:
+        logger.exception("[generation.py] write_post failed")
         return {"error": "Техническая ошибка при написании поста."}
 
 
 @tool
 async def edit_post(
     instruction: str,
-    user_id: Annotated[int, InjectedToolArg] = 0,
     draft_text: Annotated[str, InjectedToolArg] = "",
     platform: Annotated[str, InjectedToolArg] = "",
     style_description: Annotated[str, InjectedToolArg] = "",
+    user_id: Annotated[int, InjectedToolArg] = 0,
+    critique_issues: Annotated[list, InjectedToolArg] = None,
 ) -> dict:
     """Внести ТОЧЕЧНУЮ правку в существующий текст поста (например 'сделай короче', 'добавь эмодзи'). Меняет только запрошенное, остальное сохраняет. Вызывать для правки, НЕ для написания с нуля."""
-    instruction = (instruction or "").strip()
-    if not instruction:
-        print("[generation.py] edit_post: empty instruction -> error")
-        return {"error": "Не указано, что именно изменить."}
-
     draft_text = (draft_text or "").strip()
     if not draft_text:
         # сценарий А.3 №4: править нечего
-        print("[generation.py] edit_post: no draft_text in state -> error")
+        logger.info("[generation.py] edit_post: нет draft_text → error")
         return {"error": "Пока нет текста для правки — сначала напишем пост."}
 
     platform = (platform or "").strip() or "Telegram"
     style_description = (style_description or "").strip() or "(стиль не задан)"
+
+    # если правка инициирована critique — инструкция берётся из issues
+    if critique_issues:
+        instruction = "Исправь проблемы:\n- " + "\n- ".join(critique_issues)
+    instruction = (instruction or "").strip()
+    if not instruction:
+        logger.info("[generation.py] edit_post: пустая instruction → error")
+        return {"error": "Не указано, что именно изменить."}
 
     try:
         prompt = render_prompt(
             "edit_post",
             draft_text=draft_text,
             instruction=instruction,
-            style_description=style_description,
             platform=platform,
             format_rules=_format_rules_for(platform),
+            style_description=style_description,
         )
         result = await call_llm(
             messages=[HumanMessage(content=prompt)],
@@ -171,14 +178,14 @@ async def edit_post(
         )
         text = (result or "").strip()
         if not text:
-            print("[generation.py] edit_post: empty LLM output -> error")
+            logger.info("[generation.py] edit_post: пустой вывод LLM → error")
             return {"error": "Не удалось применить правку, попробуй переформулировать."}
 
-        print(f"[generation.py] edit_post OK (platform={platform}, len={len(text)})")
+        logger.info("[generation.py] edit_post OK (platform=%s, len=%d)", platform, len(text))
         return {
             "result": text,
             "updates_to_state": {"draft_text": text, "platform": platform},
         }
-    except Exception as e:
-        print(f"[generation.py] edit_post failed: {e}")
+    except Exception:
+        logger.exception("[generation.py] edit_post failed")
         return {"error": "Техническая ошибка при правке поста."}

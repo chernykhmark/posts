@@ -1,90 +1,93 @@
 # agent/graph.py
-"""
-Сборка графа: agent_node → (есть tool_calls?) → tool_node → agent_node → ... → END.
-run_graph возвращает {"reply", "interrupt"} (D-26).
-"""
 import logging
 
-from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 
 from agent.checkpointer import get_checkpointer
-from agent.nodes import agent_node, tool_node
+from agent.nodes import GENERATION_TOOLS, agent_node, critique_node, tool_node
 from agent.state import AgentState, initial_state
-from db import get_db
-from db.repositories import StyleProfilesRepo
 
 logger = logging.getLogger(__name__)
 
 _graph = None
 
 
-def _route_after_agent(state: AgentState) -> str:
-    """Если оркестратор выбрал инструмент — идём в tool_node, иначе завершаем."""
+def _route_after_agent(state) -> str:
     last = state["messages"][-1]
     if getattr(last, "tool_calls", None):
         return "tools"
     return END
 
 
-def build_graph():
-    """Компиляция графа с checkpointer."""
-    global _graph
+def _route_after_tools(state) -> str:
+    if state.get("last_generation_tool") in GENERATION_TOOLS:
+        return "critique"
+    return "agent"
+
+
+def _route_after_critique(state) -> str:
+    last = state["messages"][-1] if state.get("messages") else None
+    if last is not None and getattr(last, "tool_calls", None):
+        return "tools"
+    return "agent"
+
+
+# agent/graph.py  (замени функцию build_graph и get_graph целиком)
+def build_graph(checkpointer=None):
+    if checkpointer is None:
+        checkpointer = get_checkpointer()
+
     builder = StateGraph(AgentState)
     builder.add_node("agent", agent_node)
     builder.add_node("tools", tool_node)
+    builder.add_node("critique", critique_node)
 
     builder.add_edge(START, "agent")
     builder.add_conditional_edges("agent", _route_after_agent, {"tools": "tools", END: END})
-    builder.add_edge("tools", "agent")  # результат tool возвращается оркестратору
+    builder.add_conditional_edges("tools", _route_after_tools, {"critique": "critique", "agent": "agent"})
+    builder.add_conditional_edges("critique", _route_after_critique, {"tools": "tools", "agent": "agent"})
 
-    _graph = builder.compile(checkpointer=get_checkpointer())
+    global _graph
+    _graph = builder.compile(checkpointer=checkpointer)
     logger.info("graph compiled")
     return _graph
 
-
 def get_graph():
-    if _graph is None:
-        raise RuntimeError("graph not built")
     return _graph
 
 
+# agent/graph.py
+# agent/graph.py
 async def run_graph(thread_id: str, user_message: str, user_id: int) -> dict:
-    """Прогон графа по thread_id. Возвращает {"reply", "interrupt"}."""
-    graph = get_graph()
+    from langchain_core.messages import HumanMessage
+    from db import get_db
+    from db.repositories import StyleProfilesRepo
+
+    global _graph
+    if _graph is None:
+        _graph = build_graph(get_checkpointer())
+
     config = {"configurable": {"thread_id": thread_id}}
 
-    # текущее состояние thread (может быть пустым для нового черновика)
-    snapshot = await graph.aget_state(config)
-    if not snapshot.values:
-        # инициализируем служебные поля нового черновика
-        base = initial_state(user_id)
-        # D-32: подтянуть стиль в state, чтобы agent_node знал ветку 4.2 с первого хода
-        try:
-            style = await StyleProfilesRepo(get_db().pool).get(user_id)
-            if style:
-                base["style_description"] = style
-        except Exception as e:
-            logger.warning("failed to load style_description into state: %s", e)
-    else:
-        base = {}
+    # подтягиваем стиль юзера в state
+    style_description = ""
+    try:
+        pool = get_db().pool
+        profile = await StyleProfilesRepo(pool).get(user_id)
+        if profile:
+            style_description = profile if isinstance(profile, str) else profile.get("style_description", "")
+    except Exception:
+        logger.exception("[graph.py] не удалось подтянуть стиль")
 
     input_state = {
-        **base,
-        "user_id": user_id,
         "messages": [HumanMessage(content=user_message)],
+        "user_id": user_id,
     }
+    if style_description:
+        input_state["style_description"] = style_description
 
-    result = await graph.ainvoke(input_state, config)
+    result = await _graph.ainvoke(input_state, config=config)
 
-    # ответ юзеру — последний AIMessage без tool_calls
-    reply = ""
-    for msg in reversed(result.get("messages", [])):
-        if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
-            reply = msg.content or ""
-            break
-
-    if not reply:
-        reply = "Готово."  # на случай пустого ответа
-
-    return {"reply": reply, "interrupt": None}  # interrupt-ветка — этап 9
+    last = result["messages"][-1]
+    reply = getattr(last, "content", "") or ""
+    return {"reply": reply, "interrupt": None}
