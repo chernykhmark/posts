@@ -7,6 +7,9 @@ from typing import get_type_hints
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools.base import InjectedToolArg
 
+from langchain_core.messages import HumanMessage
+from langgraph.types import interrupt
+
 from config import settings
 from agent.llm import call_orchestrator
 from agent.critique import critique_text
@@ -27,14 +30,19 @@ _BASE_SYSTEM = (
     "На болтовню и вопросы отвечай текстом без вызова инструментов."
 )
 
+# agent/nodes.py  →  заменить константу _GENERATION_HINTS
 _GENERATION_HINTS = (
     "\n\nПравила выбора инструментов генерации:\n"
     "- Новая тема без угла → make_angle.\n"
     "- Угол есть, текста ещё нет, просят написать → write_post (С НУЛЯ).\n"
     "- Текст уже написан, просят его изменить → edit_post (ТОЧЕЧНАЯ правка, "
-    "не переписывай всё). Для любых правок готового текста всегда edit_post, не write_post."
+    "не переписывай всё). Для любых правок готового текста всегда edit_post, не write_post.\n"
+    "- Просят хуки/цепляющее начало/CTA к готовому тексту → generate_hooks_cta.\n"
+    "- Просят хэштеги к готовому тексту → generate_hashtags.\n"
+    "- Просят показать прошлые/сохранённые посты → get_history.\n"
+    "- Просят сохранить пост И текст готов → save_post. "
+    "Если текста ещё нет — не вызывай save_post, объясни, что сохранять нечего."
 )
-
 
 def _build_system_prompt(state) -> str:
     prompt = _BASE_SYSTEM + _GENERATION_HINTS
@@ -76,6 +84,8 @@ def _injected_arg_names(tool) -> set[str]:
     return injected
 
 
+# agent/nodes.py  →  функция tool_node (заменить целиком)
+# agent/nodes.py  →  функция tool_node (заменить целиком)
 async def tool_node(state):
     last = state["messages"][-1]
     tool_calls = getattr(last, "tool_calls", None) or []
@@ -119,6 +129,13 @@ async def tool_node(state):
         state_updates.update(updates)
         if name in GENERATION_TOOLS:
             state_updates["last_generation_tool"] = name
+        # новая генерация/правка текста делает пост "не сохранённым" — можно пересохранить (D-40)
+        if name in GENERATION_TOOLS:
+            state_updates["saved"] = False
+            state_updates["saved_post_ids"] = []
+        # отметка для паузы подтверждения угла (этап 9, D-39)
+        if name == "make_angle":
+            state_updates["pending_angle_confirm"] = True
 
         out_messages.append(ToolMessage(
             content=json.dumps(
@@ -202,3 +219,34 @@ async def critique_node(state):
         "critique_issues": result["issues"],
         "critique_candidates": candidates,
     }
+
+# agent/nodes.py  →  добавить в конец файла
+async def confirm_angle_node(state):
+    """Пауза после make_angle: показать угол, ждать реакции юзера (раздел 4.4, D-39).
+
+    Резолв идёт через оркестратор: ответ юзера кладём как HumanMessage,
+    роутинг ведёт в agent_node — он решает continue/смена угла/отмена.
+    """
+    angle = state.get("angle", "") or "(угол не задан)"
+    resume = interrupt({
+        "type": "confirm_angle",
+        "question": f"Предлагаю угол:\n\n{angle}\n\nОк? Или скажи, что поменять.",
+    })
+    user_reply = resume if isinstance(resume, str) else str(resume)
+    logger.info("[nodes.py] confirm_angle resume: %s", user_reply[:80])
+    return {
+        "messages": [HumanMessage(content=user_reply)],
+        "pending_angle_confirm": False,
+    }
+
+
+async def confirm_draft_node(state):
+    """Пауза после генерации текста: показать пост, ждать правок/подтверждения (4.4, D-39)."""
+    draft = state.get("draft_text", "") or "(текст пуст)"
+    resume = interrupt({
+        "type": "confirm_draft",
+        "question": f"Вот текст:\n\n{draft}\n\nПравим что-то или сохраняем?",
+    })
+    user_reply = resume if isinstance(resume, str) else str(resume)
+    logger.info("[nodes.py] confirm_draft resume: %s", user_reply[:80])
+    return {"messages": [HumanMessage(content=user_reply)]}

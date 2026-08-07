@@ -26,6 +26,14 @@ class AgentState(TypedDict, total=False):
     last_generation_tool: str
     cta_requested: bool
 
+    # HITL (этап 9)
+    auto_mode: bool
+    pending_angle_confirm: bool
+
+    # сохранение (этап 10, D-40)
+    saved: bool
+    saved_post_ids: list[int]
+
 
 def initial_state(user_id: int) -> AgentState:
     return {
@@ -44,4 +52,6 @@ def initial_state(user_id: int) -> AgentState:
         "critique_candidates": [],
         "last_generation_tool": "",
         "cta_requested": False,
+        "saved": False,
+        "saved_post_ids": [],
     }
