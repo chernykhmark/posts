@@ -99,3 +99,14 @@ async def handle_text(message: Message, bot: Bot) -> None:
     finally:
         await typing.stop()  # идемпотентно
         thread_locks.release(thread_id, lock)
+
+
+# bot/handlers.py  →  добавить хендлер (после handle_text)
+@router.message(F.photo)
+async def handle_photo(message: Message) -> None:
+    """Приём фото — заглушка (дизайн-док раздел 11, D-13).
+    Реализация приёма изображений — v3 (image_storage), генерации — v4."""
+    await message.answer(
+        "🖼 Пока не умею работать с изображениями — это появится в следующих версиях. "
+        "Пришли текст, и займёмся постом."
+    )
