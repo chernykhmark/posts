@@ -1,0 +1,10 @@
+# requirements.txt
+aiogram==3.15.0
+pydantic-settings
+python-dotenv
+asyncpg
+langgraph
+langgraph-checkpoint-postgres
+psycopg[binary,pool]
+langchain-openai
+langchain-core
